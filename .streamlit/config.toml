@@ -1,0 +1,10 @@
+# Dark "pitch" theme the dashboard is designed for (the colours match PITCH, TURF, CHALK and GOLD in app/shadow_squad.py).
+[theme]
+base = "dark"
+primaryColor = "#e0a43a"
+backgroundColor = "#0f2a22"
+secondaryBackgroundColor = "#173b30"
+textColor = "#ece7da"
+
+[browser]
+gatherUsageStats = false

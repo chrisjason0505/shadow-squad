@@ -1,0 +1,7 @@
+.streamlit/secrets.toml
+.venv/
+data/
+__pycache__/
+*.pyc
+lake/_chk/
+.ipynb_checkpoints/
