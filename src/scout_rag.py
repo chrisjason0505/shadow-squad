@@ -4,14 +4,14 @@ Retrieval: the method notes in app/knowledge/*.md are split by section and index
 embedding service). A question is matched against them together with the names of the features that moved this
 candidate most, so the passages that come back explain the numbers in the dossier.
 Generation: the dossier (every number the engine has for this candidate and this query) and the retrieved passages go
-to Claude, which answers in plain words first and then with the statistics. Without an API key the app falls back to
+to Gemini (a Google AI Studio API key, the same key Google Antigravity uses), which answers in plain words first and then with the statistics. Without an API key the app falls back to
 `offline_answer`, a template built from the same dossier, so the feature never breaks on hosting."""
 import glob, os, re
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_MODEL = 'claude-opus-5-5'
+DEFAULT_MODEL = 'gemini-3.8-flash'   # override with GEMINI_MODEL in the app secrets
 SYSTEM = """You are the chief scout behind Shadow Squad, a tool that ranks replacements for a player leaving a European club.
 You talk to football people: fans, analysts and coaches who know the game better than they know statistics.
 
@@ -21,9 +21,10 @@ How to answer:
 - Make the case. Say why he is (or is not) the best replacement on the list, and if he is not No. 1, what No. 1 has over him.
 - Use hindsight when the dossier has it: where the candidate and the top 3 are now, and how their Transfermarkt value moved, with the as-of date. Say whether the list looks good in hindsight, honestly.
 - Use only the dossier and the notes. Never invent stats, fees, injuries, wages, quotes, news or current clubs. If something is not in the data, say so. Values are Transfermarkt estimates, not fees.
+- Read numbers in their team context. The dossier says how each team played (possession, pressing, xG against) and gives style reads: a centre-back with few tackles in a dominant side with a tight defence is positionally sound, not passive; a creator who keeps taking risks in a deep side carries that team; a forward who presses hard in a high-intensity side and still beats men is rare. Prefer the style-adjusted rating to the raw one and say why they differ. Say "far more than his team's style predicts", not standard deviations.
 - Be honest about doubt: a wide rank range, a step down in an area that mattered, or that the engine finds the real signing in its top 10 only about a third of the time.
 
-Format, unless the user asks for something else: a short verdict paragraph (two to four sentences), then a section headed "For the football nerds" with four to six bullet points on the like-for-like profile, the part of the game where he is a step up or down, the fit with the club's style, price and age, and hindsight if available. Under 300 words."""
+Format, unless the user asks for something else: a short verdict paragraph (two to four sentences), then a section headed "For the football nerds" with four to six bullet points on the like-for-like profile, the style read, the part of the game where he is a step up or down, the fit with the club's style, price and age, and hindsight if available. Under 300 words."""
 
 
 def _chunks():
@@ -60,24 +61,45 @@ def build_prompt(question, dossier, passages):
 
 
 def api_key(secrets=None):
-    """The key from Streamlit secrets first, then the environment."""
-    try:
-        if secrets is not None and 'ANTHROPIC_API_KEY' in secrets: return secrets['ANTHROPIC_API_KEY']
-    except Exception: pass   # st.secrets raises when no secrets file exists
-    return os.environ.get('ANTHROPIC_API_KEY')
+    """The Gemini key (Google AI Studio, the same key Antigravity uses) from Streamlit secrets first, then the environment."""
+    for k in ('GEMINI_API_KEY', 'GOOGLE_API_KEY'):
+        try:
+            if secrets is not None and k in secrets: return secrets[k]
+        except Exception: pass   # st.secrets raises when no secrets file exists
+        if os.environ.get(k): return os.environ[k]
+    return None
+
+
+def _pick_model(client):
+    """When the configured model is retired, fall back to the newest Flash model the key can use."""
+    names = [m.name.split('/')[-1] for m in client.models.list() if 'generateContent' in (getattr(m, 'supported_actions', None) or [])]
+    flash = sorted((n for n in names if 'flash' in n and not any(x in n for x in ('image', 'tts', 'live', 'lite', 'audio'))), reverse=True)
+    return (flash or names or [DEFAULT_MODEL])[0]
 
 
 def stream_answer(question, dossier, passages, key, history=(), model=None):
-    """Yields the answer text as it streams. history: earlier (question, answer) pairs about the same candidate.
-    Server-side fallbacks are on, so a request a safety classifier declines is retried on a fallback model."""
-    import anthropic
-    client = anthropic.Anthropic(api_key=key, max_retries=2, timeout=90.0); msgs = []
-    for q, a in history: msgs += [{'role': 'user', 'content': q}, {'role': 'assistant', 'content': a}]
-    msgs.append({'role': 'user', 'content': build_prompt(question, dossier, passages)})
-    with client.beta.messages.stream(model=model or DEFAULT_MODEL, max_tokens=4000, system=SYSTEM, messages=msgs, output_config={'effort': 'low'},
-                                     betas=['server-side-fallback-2026-07-01'], fallbacks='default') as stream:
-        for text in stream.text_stream: yield text
-        if stream.get_final_message().stop_reason == 'refusal': yield '\n\n_The model declined to answer this question. Try rephrasing it._'
+    """Yields the answer text as it streams from Gemini. history: earlier (question, answer) pairs about the same candidate.
+    A model name the key cannot use (404) falls back to the newest Flash model on the account."""
+    import itertools
+    from google import genai
+    from google.genai import types, errors
+    client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=90_000))
+    contents = []
+    for q, a in history: contents += [types.Content(role='user', parts=[types.Part(text=q)]), types.Content(role='model', parts=[types.Part(text=a)])]
+    contents.append(types.Content(role='user', parts=[types.Part(text=build_prompt(question, dossier, passages))]))
+    cfg = types.GenerateContentConfig(system_instruction=SYSTEM, max_output_tokens=4000, temperature=0.4)
+    def start(name):
+        it = iter(client.models.generate_content_stream(model=name, contents=contents, config=cfg)); return itertools.chain([next(it)], it)
+    try: chunks = start(model or DEFAULT_MODEL)
+    except errors.ClientError as e:
+        if getattr(e, 'code', None) != 404: raise
+        chunks = start(_pick_model(client))
+    blocked = False
+    for chunk in chunks:
+        if chunk.text: yield chunk.text
+        fr = chunk.candidates[0].finish_reason if chunk.candidates else None
+        if fr is not None and str(fr).split('.')[-1] in ('SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'RECITATION'): blocked = True
+    if blocked: yield '\n\n_The model stopped this answer early. Try rephrasing the question._'
 
 
 def offline_answer(d):
@@ -96,6 +118,7 @@ def offline_answer(d):
     if d['down']: nerd.append('- Step down: ' + '; '.join(d['down'][:3]) + '.')
     if d['adds']: nerd.append('- Adds: ' + '; '.join(d['adds'][:3]) + '.')
     if d['style']: nerd.append(f"- Fit: {d['club']} were {d['style']}; his numbers here are already adjusted to that style.")
+    for x in d.get('reads') or []: nerd.append('- Style read: ' + x)
     if d['cons']: nerd.append('- Question marks: ' + '; '.join(d['cons']) + '.')
     show3 = d['top3'] and any(w in d['question'].lower() for w in ('top 3', 'top three', 'now', 'hindsight', 'where', 'value'))
     if d['hs'] and not (show3 and d['rank'] <= 3): nerd.append('- Hindsight: ' + d['hs'])

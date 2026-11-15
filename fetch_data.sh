@@ -9,3 +9,5 @@ get davidcariboo/player-scores transfermarkt                                   #
 get emrey3lmaz/top-5-league-football-player-stats-2017-2025 emrey              # FBref 2024-25, scraped before the advanced stats were removed
 get samyogguragai/top-5-european-leagues-2014-2025 understat_alt               # Understat player seasons 2014-15 to 2024-25 (no La Liga)
 get hiuhiuthen/understat-player-league-2025-26 understat_2025                  # Understat player seasons 2025-26
+# Team style table for the app (possession, pressing, xG against). FotMob team JSONs are optional: put them in data/fotmob/<league>/<yyyy_yyyy>/teams/.
+[ -f lake/team_style.parquet ] || ${PY:-.venv/bin/python} src/build_team_style.py

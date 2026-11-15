@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import numpy as np, pandas as pd, streamlit as st, matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import engine as E, ga as GA, formation as FM, scout_rag as RAG, football as FB
+import engine as E, ga as GA, formation as FM, scout_rag as RAG, football as FB, style_ratings as SR
 from common import MID
 
 PITCH, TURF, CHALK, LINE, GOLD, MUTE = '#0f2a22', '#173b30', '#ece7da', '#2c5a4a', '#e0a43a', '#9db3a7'
@@ -35,6 +35,7 @@ h1, h2, h3, .disp {{ font-family: 'Barlow Condensed', sans-serif; letter-spacing
 .note {{ color:{MUTE}; font-size:14px; line-height:1.55; max-width:70ch; }}
 .big {{ font:700 34px/1 'Barlow Condensed'; color:{CHALK}; }} .big small {{ display:block; font:400 13px 'Barlow'; color:{MUTE}; margin-top:4px; }}
 .st-key-pitch a, .st-key-pitch a:hover {{ text-decoration:none !important; }} a.slot {{ cursor:pointer; }} a.slot:focus circle {{ stroke:{CHALK}; stroke-width:3; }}
+.tag {{ display:inline-block; font:600 12.5px 'Barlow'; padding:2px 8px; margin:2px 6px 2px 0; border-radius:10px; background:#1f4a3c; color:{GOLD}; border:1px solid #2f6250; }}
 @media (max-width: 800px) {{ .card {{ grid-template-columns:48px 1fr; }} .card .val {{ grid-column:2; text-align:left; }} }}
 </style>""")
 LGCOL = {'Premier League': '#8f6bd6', 'La Liga': '#e0733a', 'Bundesliga': '#d64545', 'Serie A': '#3f8fd1', 'Ligue 1': '#3fb58a'}
@@ -48,6 +49,28 @@ def load():
     lake = E.Lake(); models = E.load_models(); ev = pd.read_parquet(L('replacement_events')); rd = lambda n: pd.read_parquet(L(n)) if os.path.exists(L(n)) else None
     return lake, models, ev, rd('live_squads.parquet'), rd('live_shortlists.parquet'), rd('value_history.parquet')
 lake, models, EV, SQ, SL, VH = load(); F = lake.F
+
+
+@st.cache_resource(show_spinner='Rating every action against team style...')
+def ratings():
+    """Style-adjusted ratings and outlier reads (src/style_ratings.py), or None without lake/team_style.parquet."""
+    p = L('team_style.parquet')
+    return SR.StyleRatings(F, pd.read_parquet(p)) if os.path.exists(p) else None
+RT = ratings()
+
+
+def rt_year(pid):
+    """The season to rate a player on: the shown season in a backtest, his latest lake season in live mode."""
+    if RT is None: return None
+    if not live: return int(season) if (int(pid), int(season)) in RT.P.index else None
+    ys = [y for (p_, y) in RT.P.index[RT.P.index.get_level_values(0) == int(pid)]]
+    return max(ys) if ys else None
+
+
+def tags_html(pid, k=3):
+    y = rt_year(pid)
+    if y is None: return ''
+    return ''.join(f'<span class="tag" title="{s_}">{t}</span>' for t, s_ in RT.outliers(int(pid), y, k))
 def pick(label, options, key, fmt=str, col=st):
     options = list(options); d = qp.get(key); i = next((n for n, o in enumerate(options) if str(o) == d), 0); v = col.selectbox(label, options, index=i, format_func=fmt, key='w_' + key); qp[key] = str(v); return v
 ini = lambda n: ''.join(w[0] for w in str(n).replace('-', ' ').split()[:2]).upper()
@@ -217,6 +240,17 @@ def scout(r, cid, feats, M):
     return out
 
 
+def style_lines(pid, name):
+    """Team style, ratings and outlier reads for one player, as dossier lines."""
+    y = rt_year(pid)
+    if y is None: return []
+    g = RT.get(pid, y); tw = SR.StyleRatings.team_words(g); out = []
+    if tw: out.append(f"How {g['squad']} played in {y}-{str(y + 1)[2:]} (team data from Understat and FotMob): {tw}.")
+    out.append(f"{name}'s rating, 0-100 against his position: {g['rating_adj']:.0f} adjusted for team style, {g['rating_raw']:.0f} raw.")
+    out += [f"Style read on {name}, {t}: {s_}" for t, s_ in RT.outliers(int(pid), y)]
+    return out
+
+
 def dossier(r, feats, M, sim, sc):
     """Everything the explainer may use, football reading first, technical detail last."""
     H = hindsight(); S = srow['player']; pos = FB.POS.get(srow['fine_pos'], srow['fine_pos']); names = FB.MET_LIVE if live else FB.MET_BT
@@ -226,6 +260,7 @@ def dossier(r, feats, M, sim, sc):
           f"Player leaving: {S}, {pos}, age {srow['age']:.0f}, {int(srow['minutes']):,} league minutes, valued at {eur(srow.get('value', np.nan))}. Profile: {sc['role_s']}.",
           f"Candidate: {r['player']}, {r['squad']} ({r['comp']}), age {r['age']:.0f}, valued at {eur(r['value'])}. Profile: {sc['role_c']}.",
           f"Place on the shadow list: No. {int(r['rank'])}" + (f" of {int(r['n_pool'])} {FB.POS_PL.get(srow['fine_pos'], 'players')} considered" if pd.notna(r.get('n_pool', np.nan)) else ' of the 15 listed') + f"; across the ten models of the ensemble he ranks between {int(r['rank_lo'])} and {int(r['rank_hi'])}."]
+    L_ += style_lines(sid, S) + style_lines(int(r['player_id']), r['player'])
     if sc['vs1']: L_.append(f"No. 1 on the list is {sc['vs1'][0]}; the model puts him ahead mainly because " + (', and '.join(sc['vs1'][1]) if sc['vs1'][1] else 'of small margins across several factors') + '.')
     L_.append('Why the model rates him (strongest first): ' + ('; '.join(sc['pros']) or 'no single reason stands out') + '.')
     if sc['cons']: L_.append('What counts against him: ' + '; '.join(sc['cons']) + '.')
@@ -279,7 +314,7 @@ def explain_block(r, cid):
     feats, M, sim = evidence(r, cid); sc = scout(r, cid, feats, M); dos = dossier(r, feats, M, sim, sc); H = hindsight()
     tab1, tab2 = st.tabs(['Ask why', "Scout's report (for football nerds)"])
     with tab1:
-        key = secret('ANTHROPIC_API_KEY'); hk = f'qa_{season}_{club}_{sid}_{cid}'; hist = st.session_state.setdefault(hk, [])
+        key = secret('GEMINI_API_KEY') or secret('GOOGLE_API_KEY'); hk = f'qa_{season}_{club}_{sid}_{cid}'; hist = st.session_state.setdefault(hk, [])
         drivers = ['live engine', 'sim_profile', 'value_gap'] if live else list(feats['key'].head(4))
         default_q = 'Why is he the right replacement, and where is he a risk?'
         if not live: st.caption('Try: "Why is he the best replacement?", "What would the team lose?", "Where are the top 3 now?"')
@@ -295,19 +330,20 @@ def explain_block(r, cid):
             with st.chat_message('assistant'):
                 ans = None
                 if key:
-                    try: ans = st.write_stream(RAG.stream_answer(q, dos, passages, key, [(a, b) for a, b, _ in hist], model=secret('CLAUDE_MODEL')))
+                    try: ans = st.write_stream(RAG.stream_answer(q, dos, passages, key, [(a, b) for a, b, _ in hist], model=secret('GEMINI_MODEL')))
                     except Exception as e: st.warning(f'The language model could not be reached ({type(e).__name__}); showing the built-in explanation instead.')
                 if not ans:
                     ans = RAG.offline_answer({'name': r['player'], 'rank': int(r['rank']), 'lo': int(r['rank_lo']), 'hi': int(r['rank_hi']), 'starter': srow['player'], 'club': club,
                                               'role_s': sc['role_s'], 'role_c': sc['role_c'], 'pros': sc['pros'], 'cons': sc['cons'], 'keeps': sc['keeps'], 'down': sc['down'], 'adds': sc['adds'],
                                               'price': (eur(r['value']), eur(srow.get('value', np.nan))), 'age': (float(r['age']), float(srow['age'])), 'vs1': sc['vs1'], 'style': sc['style'],
                                               'dims': [(d, FB.tier(sc['dims_s'][d]), FB.tier(sc['dims_c'].get(d, np.nan))) for d in sc['dims_s']],
+                                              'reads': [f"{n_} ({t.lower()}): {s_}" for p_, n_ in ((sid, srow['player']), (int(cid), r['player'])) if rt_year(p_) is not None for t, s_ in RT.outliers(int(p_), rt_year(p_), 2)],
                                               'hs': H.line(sc['hs'], r['player']) if sc['hs'] else None, 'top3': [f'No. {k} ' + H.line(h, n) for n, k, h in sc['top3']], 'question': q})
                     st.markdown(ans)
                 with st.expander('Notes this answer drew on'):
                     for p_ in passages: st.markdown(f"**{p_['title']}** (match {p_['score']:.2f})\n\n{p_['text']}")
             hist.append((q, ans, passages))
-        if not key: st.caption('Free-form answers need an Anthropic API key in the app secrets (ANTHROPIC_API_KEY). Without one you get the built-in scout report, built from the same numbers.')
+        if not key: st.caption('Free-form answers need a Gemini API key from Google AI Studio (the key Antigravity uses) in the app secrets as GEMINI_API_KEY. Without one you get the built-in scout report, built from the same numbers.')
     with tab2:
         verdict = (f"Top of the list to replace {srow['player']}." if int(r['rank']) == 1 else f"No. {int(r['rank'])} on the list to replace {srow['player']}" + (f"; No. 1 is {sc['vs1'][0]}." if sc['vs1'] else '.'))
         st.html(f'<div class="big">{r["player"]}<small>{sc["role_c"][0].upper() + sc["role_c"][1:]}. {verdict}</small></div>'
@@ -321,6 +357,9 @@ def explain_block(r, cid):
             st.html(f'<div class="disp" style="font:600 19px Barlow Condensed;color:{GOLD}">Why him</div>' + li([p[0].upper() + p[1:] for p in sc['pros']], 'No single reason stands out.')
                     + (f'<div class="disp" style="font:600 19px Barlow Condensed;color:{MUTE};margin-top:10px">Question marks</div>' + li([c[0].upper() + c[1:] for c in sc['cons']], '') if sc['cons'] else '')
                     + (f'<div class="note" style="margin-top:10px">Why {sc["vs1"][0]} is No. 1 instead: ' + (', and '.join(sc['vs1'][1]) if sc['vs1'][1] else 'small margins across several factors') + '.</div>' if sc['vs1'] else ''))
+        reads = [(n_, t, s_) for p_, n_ in ((sid, srow['player']), (int(cid), r['player'])) if rt_year(p_) is not None for t, s_ in RT.outliers(int(p_), rt_year(p_))]
+        if reads:
+            st.html(f'<div class="disp" style="font:600 19px Barlow Condensed;color:{GOLD};margin-top:6px">Style read: what the numbers mean in their teams</div>' + ''.join(f'<div class="note" style="margin-top:6px"><b style="color:{CHALK}">{n_}</b> <span class="tag">{t}</span>{s_}</div>' for n_, t, s_ in reads))
         k1, k2, k3 = st.columns(3)
         k1.html(f'<div class="disp" style="font:600 19px Barlow Condensed;color:{CHALK}">Keeps what you lose</div>' + li(sc['keeps'][:5], 'None of the starter\'s strengths is matched like for like.'))
         k2.html(f'<div class="disp" style="font:600 19px Barlow Condensed;color:{CHALK}">Step down</div>' + li(sc['down'][:5], 'No clear drop-off in any area.'))
@@ -348,7 +387,12 @@ def explain_block(r, cid):
 
 
 @st.cache_resource
-def pct_table(): return FB.season_pct(lake.F)
+def pct_table(kind='raw'):
+    """Percentiles and per-90s per (player, season): raw, or adjusted for team style when the team style table exists."""
+    if kind == 'raw' or RT is None: return FB.season_pct(lake.F)
+    P = RT.P; out = pd.DataFrame(index=P.index); out['fine_pos'] = P['fine_pos']
+    for m in FB.MET_BT: out[m] = P[m + '_pct_adj']; out[m + '_raw'] = P[m + '_adj']
+    return out
 
 
 ordn = lambda p: f"{p:.0f}" + ("th" if 10 <= round(p) % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(round(p) % 10, "th"))
@@ -361,7 +405,7 @@ def heat(p):
     a = p / 100; return f'background:rgba(224,164,58,{0.06 + 0.82 * a ** 1.6:.2f});color:{PITCH if p >= 75 else CHALK}'
 
 
-def matrix_html(cols, data, pos, live, show_raw):
+def matrix_html(cols, data, pos, live, show_raw, tags=None):
     """Departments x metrics against the starter and his replacements. cols: [(pid, header html)]; data: {pid: {metric: (pct, per90, season)}}."""
     depts = FB.DEPT_LIVE if live else FB.DEPT_BT; order = [d for d in FB.DEPT_ORDER.get(pos, list(depts)) if d in depts] + [d for d in depts if d not in FB.DEPT_ORDER.get(pos, [])]
     names = FB.MET_LIVE if live else FB.MET_BT; s0 = cols[0][0]; th = 'padding:8px 10px;font:600 14px Barlow Condensed;color:' + CHALK
@@ -377,6 +421,8 @@ def matrix_html(cols, data, pos, live, show_raw):
                 sub = (f'<div style="font-size:10px;opacity:.75">{ordn(pc)} pct' + (f' {DOT} {yr}-{str(yr + 1)[2:]}' if yr is not None and show_raw else '') + '</div>') if show_raw and np.isfinite(pc) else ''
                 cells.append(f'<td style="{heat(pc)};text-align:center;padding:5px 4px;border-radius:2px">{txt}{sub}</td>')
             h.append(f'<tr><td style="padding:4px 10px 4px 22px;color:{MUTE}">{names.get(m, m)}</td>' + ''.join(cells) + '</tr>')
+    if tags and any(tags.values()):
+        h.append(f'<tr><td style="padding:9px 10px 5px;font:600 16px Barlow Condensed;color:{GOLD}">Style read</td>' + ''.join(f'<td style="text-align:center;vertical-align:top;padding:6px 2px">{tags.get(pid, "")}</td>' for pid, _ in cols) + '</tr>')
     return ''.join(h) + '</table></div>'
 
 
@@ -384,8 +430,28 @@ if view == 'Squad':
     a, b = st.columns([1.05, 1])
     fo = a.selectbox('Formation', ['auto'] + list(FM.TEMPLATES), format_func=lambda f: 'Auto (from positions and minutes)' if f == 'auto' else f, key='w_form')
     with a.container(key='pitch'): svg, fname = pitch(squad, sid, fo); st.markdown(svg, unsafe_allow_html=True); st.html(f'<div class="note">{"The fuller the circle, the higher the estimated chance the player is gone by next season." if live else "Filled circles are starters who played under 450 league minutes for the club the next season."} Select a player to open his shadow list.</div>')
+    if RT is not None:
+        rows_ = []
+        for _, q_ in squad.iterrows():
+            y_ = rt_year(q_['player_id'])
+            if y_ is None: continue
+            g_ = RT.get(q_['player_id'], y_); rows_.append({'player': q_['player'], 'pos': q_['fine_pos'], 'style-adjusted': g_['rating_adj'], 'raw': g_['rating_raw'], 'style read': ', '.join(t for t, _ in RT.outliers(int(q_['player_id']), y_, 2))})
+        if rows_:
+            with a:
+                st.html(f'<div class="disp" style="font:600 20px Barlow Condensed;color:{GOLD};margin-top:12px">Squad ratings, adjusted for how {club} play</div>')
+                st.dataframe(pd.DataFrame(rows_).sort_values('style-adjusted', ascending=False), hide_index=True, width='stretch',
+                             column_config={'style-adjusted': st.column_config.ProgressColumn(min_value=0, max_value=100, format='%.0f'), 'raw': st.column_config.NumberColumn(format='%.0f')})
+                st.html('<div class="note">Ratings run 0 to 100 against players in the same position across the five leagues. The adjusted rating scales defensive actions up for players whose team had the ball (fewer chances to defend) and actions on the ball down a little, and for starting defenders it credits how little the team conceded. Hover a tag in the dossiers for the full read.</div>')
     with b:
         st.html(f'<div class="big">{srow["player"]}<small>{srow["fine_pos"]}, age {srow["age"]:.0f}, {int(srow["minutes"]):,} league minutes, {eur(srow.get("value", np.nan))}</small></div>')
+        ys = rt_year(sid)
+        if ys is not None:
+            rr = RT.get(sid, ys); when = '' if not live else f" (his {ys}-{str(ys + 1)[2:]} season at {rr['squad']})"
+            r1, r2 = st.columns(2)
+            r1.html(f'<div class="big" style="color:{GOLD}">{rr["rating_adj"]:.0f}<small>rating adjusted for team style{when}</small></div>')
+            r2.html(f'<div class="big">{rr["rating_raw"]:.0f}<small>raw rating (per-90 percentiles only)</small></div>')
+            tw = SR.StyleRatings.team_words(rr); reads = RT.outliers(sid, ys)
+            st.html((f'<div class="note" style="margin-top:8px">{rr["squad"]} {tw}.</div>' if tw else '') + ''.join(f'<div class="note" style="margin-top:6px"><span class="tag">{t}</span>{s_}</div>' for t, s_ in reads))
         if live: st.html(f'<div class="note" style="margin-top:14px">Departure risk <b style="color:{GOLD}">{srow["risk"]:.0%}</b>. Contract until {srow["contract_until"] if pd.notna(srow["contract_until"]) else "unknown"} (shown for context; the risk model does not use it, because past contract dates are not in the data).</div>')
         else:
             real = EV[(EV['t'] == int(season)) & (EV['S'] == sid)]
@@ -399,7 +465,7 @@ elif view == 'Shadow list':
     with st.container(key='cards'):
         st.html(''.join(f'<div class="card {"first" if int(r["rank"]) == 1 else ""}"><div class="rk">{int(r["rank"])}<small>{int(r["rank_lo"])} to {int(r["rank_hi"])}</small></div><div class="who"><span class="ini">{ini(r["player"])}</span>{r["player"]}</div>'
                         f'<div class="val">{eur(r["value"])}<small>starter {eur(r["ref_value"])}</small></div><div class="meta"><span class="lg" style="background:{LGCOL.get(r["comp"], MUTE)}"></span>{r["squad"]}, {r["comp"]}, age {r["age"]:.0f}</div>'
-                        f'<div class="why">{r["why"]}</div>' + (f'<div class="pat">{r["patterns"]}</div>' if r["patterns"] else '') + '</div>' for _, r in Y.head(10).iterrows()))
+                        f'<div class="why">{r["why"]}</div>' + (f'<div class="pat">{tags_html(r["player_id"])}</div>' if tags_html(r["player_id"]) else '') + (f'<div class="pat">{r["patterns"]}</div>' if r["patterns"] else '') + '</div>' for _, r in Y.head(10).iterrows()))
     if not live:
         HSa = hs_rows(X.head(10)); st.html(f'<div class="disp" style="font:600 22px Barlow Condensed;color:{GOLD};margin-top:18px">Hindsight: where the top 10 are now</div>')
         st.dataframe(pd.DataFrame([{'rank': int(x['rank']), 'player': x['player'], 'club then': h['club_then'], 'value then': h['value_then'] / 1e6, 'club now': h['club_now'], 'as of': h['club_now_source'],
@@ -423,15 +489,17 @@ elif view == 'Matrix':
     m1, m2, m3 = st.columns([1.2, 1.4, 1.4]); n = m1.slider('Replacements to compare', 3, 10, 5, key='w_mn')
     mode = 'This season' if live else (m2.segmented_control('Numbers', ['That season', 'Peak (best of last 3 seasons)'], default='That season', key='w_mpeak') or 'That season')
     show = m3.segmented_control('Show', ['Percentile', 'Per 90 + percentile'], default='Per 90 + percentile' if not live else 'Percentile', key='w_mraw') or 'Percentile'
+    adjm = (st.segmented_control('Rate actions', ['Adjusted for team style', 'Raw'], default='Adjusted for team style', key='w_madj') or 'Adjusted for team style') if (RT is not None and not live) else 'Raw'
     Xs = X.head(n); peak = mode.startswith('Peak')
     if live:
         ZL = [c for c in SL.columns if c.startswith('z_')]; s0 = SQ[SQ['player_id'] == sid]
         data = FB.matrix_live(pd.concat([s0[['player_id'] + ZL], Xs[['player_id'] + ZL]]), ZL); show_raw = False
     else:
-        data = FB.matrix_bt(pct_table(), [sid] + Xs['player_id'].tolist(), int(season), peak=peak); show_raw = show != 'Percentile'
+        data = FB.matrix_bt(pct_table('adj' if adjm.startswith('Adjusted') else 'raw'), [sid] + Xs['player_id'].tolist(), int(season), peak=peak); show_raw = show != 'Percentile'
     cols = [(sid, f'{srow["player"]}<div style="font:400 11px Barlow;color:{MUTE}">leaving \u00b7 {eur(srow.get("value", np.nan))}</div>')] + [(int(x['player_id']), f'{int(x["rank"])}. {x["player"]}<div style="font:400 11px Barlow;color:{MUTE}">{x["squad"]} \u00b7 {eur(x["value"])}</div>') for _, x in Xs.iterrows()]
-    st.html(f'<div class="note" style="margin-bottom:8px">{srow["player"]} against the first {n} names on his shadow list, department by department, ordered by what matters most for a {FB.POS.get(srow["fine_pos"], "player")}. Each cell is the percentile among {FB.POS_PL.get(srow["fine_pos"], "players")} in the five leagues that season (900+ minutes)' + ('' if live else ', with the per-90 number above it') + '. Department rows average their metrics; \u25b2 / \u25bc mark a replacement 10+ points above or below the starter.' + (' Peak takes each player\'s best season of the last three for each metric, so it shows his ceiling rather than his latest form.' if peak else '') + (' Live numbers are Understat per-90s; percentiles are estimated from the standardised scores.' if live else ' These are the numbers the players actually posted at their clubs, before the style adjustment the engine applies.') + '</div>')
-    st.html(matrix_html(cols, data, srow['fine_pos'], live, show_raw))
+    st.html(f'<div class="note" style="margin-bottom:8px">{srow["player"]} against the first {n} names on his shadow list, department by department, ordered by what matters most for a {FB.POS.get(srow["fine_pos"], "player")}. Each cell is the percentile among {FB.POS_PL.get(srow["fine_pos"], "players")} in the five leagues that season (900+ minutes)' + ('' if live else ', with the per-90 number above it') + '. Department rows average their metrics; \u25b2 / \u25bc mark a replacement 10+ points above or below the starter.' + (' Peak takes each player\'s best season of the last three for each metric, so it shows his ceiling rather than his latest form.' if peak else '') + (' Live numbers are Understat per-90s; percentiles are estimated from the standardised scores.' if live else ' ' + (' Numbers are adjusted for each team\'s possession (see below); a Style read row at the bottom flags style outliers.' if adjm.startswith('Adjusted') else ' These are the numbers the players actually posted at their clubs, before any style adjustment.') + '') + '</div>')
+    st.html(matrix_html(cols, data, srow['fine_pos'], live, show_raw, tags={pid: tags_html(pid, 2) for pid, _ in cols}))
+    if adjm.startswith('Adjusted'): st.html('<div class="note" style="margin-top:8px">Adjusted for team style: defensive actions are scaled up for players whose team had more of the ball (2 / (1 + e^(-0.1 x (possession - 50))), about x1.4 at 58%), and actions on the ball are scaled down by the square root of the same factor. Goal threat and aerial win rate are not adjusted. Per-90 numbers shown are the adjusted ones; switch to Raw for the originals.</div>')
 else:
     risky = squad.sort_values('risk', ascending=False); default = risky['player_id'].head(3).tolist() if live else (risky[risky['risk'] >= 1]['player_id'].head(4).tolist() if (risky['risk'] >= 1).sum() >= 2 else risky['player_id'].head(2).tolist())
     chosen = st.multiselect('Starters to replace', squad['player_id'].tolist(), default=default, format_func=lambda i: f"{squad.loc[squad['player_id'] == i, 'player'].iat[0]} ({squad.loc[squad['player_id'] == i, 'fine_pos'].iat[0]})", key='w_slots')

@@ -19,17 +19,18 @@ Pick a season ("Now" for the live shortlists, or a past season to see what the l
 - **Pitch.** The starters are laid out in a formation inferred from their positions and minutes (`src/formation.py`: 4-3-3, 4-2-3-1, 4-4-2, 4-1-4-1, 3-5-2 or 3-4-3), one slot per player; the rest sit on a bench strip. The formation can be overridden above the pitch.
 - **Matrix.** The departing starter against the first 3 to 10 names on his shadow list, department by department (ordered by what matters for the position), each cell a percentile among players in that position with the per-90 number. "Peak" swaps in each player's best season of the last three.
 - **Hindsight.** For past seasons the Squad cards and the Shadow list show where the players on the list are now and their latest Transfermarkt value (data up to June 2026). To refresh: re-download `data/transfermarkt`, run `.venv/bin/python src/build_player_now.py`, and commit `lake/player_now.parquet`.
-- **Why this player?** Compare view, under the radar. "Ask why" answers questions about the pick with Claude, grounded in a dossier of that candidate's numbers (SHAP values, pool percentiles, per-90 z-scores, rank interval) and the method notes in `app/knowledge/`, retrieved with TF-IDF (`src/scout_rag.py`). "Scout's report" puts the same case in football terms (role, what he keeps, where he is a step down, fit with the club's style, where the top 3 are now), with the raw numbers in an expander.
+- **Style-adjusted ratings and style reads.** `lake/team_style.parquet` holds how every club-season played (possession, PPDA pressing, deep completions allowed, xG for and against, tackles, long balls), built by `src/build_team_style.py` from the Kaggle Understat dump and the FotMob team tables. `src/style_ratings.py` rates every action against that: defensive actions are possession-adjusted (a centre-back at a side with 60% of the ball gets fewer chances to defend), starting defenders get credit for how little the team conceded, and style outliers are flagged (two-way players in high-press sides, risk-takers in deep sides, direct runners in patient sides, playmakers in long-ball sides, positionally sound defenders in tight defences). The Squad view shows raw and adjusted ratings; the Matrix can rate actions either way.
+- **Why this player?** Compare view, under the radar. "Ask why" answers questions about the pick with Gemini, grounded in a dossier of that candidate's numbers (SHAP values, pool percentiles, per-90 z-scores, rank interval) and the method notes in `app/knowledge/`, retrieved with TF-IDF (`src/scout_rag.py`). "Scout's report" puts the same case in football terms (role, what he keeps, where he is a step down, fit with the club's style, where the top 3 are now), with the raw numbers in an expander.
 
 ### Secrets (optional)
 
-Free-form answers need an Anthropic API key. Without it the app still runs and shows a built-in explanation built from the same numbers.
+Free-form answers need a Gemini API key from Google AI Studio (https://aistudio.google.com/apikey; it is the same key Google Antigravity uses). Without it the app still runs and shows a built-in explanation built from the same numbers.
 
 ```
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # then fill in ANTHROPIC_API_KEY; do not commit this file
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # then fill in GEMINI_API_KEY; do not commit this file
 ```
 
-On Streamlit Community Cloud, paste the same lines into App settings > Secrets instead. `CLAUDE_MODEL` is optional (default `claude-opus-5-5`). The explainer turns on server-side refusal fallbacks, so a question a safety filter declines is retried on another model.
+On Streamlit Community Cloud, paste the same lines into App settings > Secrets instead. `GEMINI_MODEL` is optional (default `gemini-3.8-flash`); if the key cannot use it, the app falls back to the newest Flash model on the account.
 
 ## Reproduce everything
 
