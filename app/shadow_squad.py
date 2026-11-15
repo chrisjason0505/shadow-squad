@@ -67,6 +67,27 @@ def rt_year(pid):
     return max(ys) if ys else None
 
 
+CAT_COL = {"Changes the team's dynamic": '#e0a43a', 'Focal point': '#7fc4a4', 'Defensive intelligence': '#8fb4e0', 'Role note': '#9db3a7'}
+
+
+def reads_html(pid, name=None, k=4):
+    """Categorised style reads with the numbers behind each one."""
+    y = rt_year(pid)
+    if y is None: return ''
+    R_ = RT.reads(int(pid), y, k)
+    if not R_: return f'<div class="note" style="margin-top:6px">{name + ": " if name else ""}no style outlier: his numbers are about what {RT.get(int(pid), y)["squad"]}\'s style predicts.</div>'
+    h = []
+    for cat in SR.StyleRatings.CATS:
+        xs = [x for x in R_ if x['cat'] == cat]
+        if not xs: continue
+        col = CAT_COL.get(cat, MUTE)
+        h.append(f'<div style="margin-top:12px;font:600 13px Barlow;letter-spacing:.06em;text-transform:uppercase;color:{col}">{cat}' + (f' <span style="color:{MUTE};text-transform:none;letter-spacing:0">({name})</span>' if name else '') + '</div>')
+        for x in xs:
+            ev = ''.join(f'<span style="display:inline-block;margin:4px 6px 0 0;padding:2px 8px;border-radius:3px;background:#14322a;font-size:12.5px;color:{MUTE}">{a_}: <b style="color:{CHALK}">{b_}</b></span>' for a_, b_ in x['ev'])
+            h.append(f'<div style="border-left:3px solid {col};padding:6px 12px;margin-top:6px;background:{TURF}"><div style="font:600 17px Barlow Condensed;color:{CHALK}">{x["tag"]}</div><div class="note" style="max-width:none">{x["text"]}</div><div>{ev}</div></div>')
+    return ''.join(h)
+
+
 def tags_html(pid, k=3):
     y = rt_year(pid)
     if y is None: return ''
@@ -312,38 +333,7 @@ def li(items, empty):
 
 def explain_block(r, cid):
     feats, M, sim = evidence(r, cid); sc = scout(r, cid, feats, M); dos = dossier(r, feats, M, sim, sc); H = hindsight()
-    tab1, tab2 = st.tabs(['Ask why', "Scout's report (for football nerds)"])
-    with tab1:
-        key = secret('GEMINI_API_KEY') or secret('GOOGLE_API_KEY'); hk = f'qa_{season}_{club}_{sid}_{cid}'; hist = st.session_state.setdefault(hk, [])
-        drivers = ['live engine', 'sim_profile', 'value_gap'] if live else list(feats['key'].head(4))
-        default_q = 'Why is he the right replacement, and where is he a risk?'
-        if not live: st.caption('Try: "Why is he the best replacement?", "What would the team lose?", "Where are the top 3 now?"')
-        with st.form(f'f_{hk}', clear_on_submit=True, border=False):
-            q = st.text_input('Ask about this pick', placeholder=default_q, key=f'q_{hk}'); go = st.form_submit_button('Explain')
-        if go: q = q.strip() or default_q
-        for qq, aa, src in hist:
-            with st.chat_message('user'): st.markdown(qq)
-            with st.chat_message('assistant'): st.markdown(aa)
-        if go:
-            passages = retriever().search(RAG.retrieval_query(q, drivers + ['football', 'replacement']), k=4, exclude={'The ten ranking features (backtest engine)'} if live else {'Live engine'})
-            with st.chat_message('user'): st.markdown(q)
-            with st.chat_message('assistant'):
-                ans = None
-                if key:
-                    try: ans = st.write_stream(RAG.stream_answer(q, dos, passages, key, [(a, b) for a, b, _ in hist], model=secret('GEMINI_MODEL')))
-                    except Exception as e: st.warning(f'The language model could not be reached ({type(e).__name__}); showing the built-in explanation instead.')
-                if not ans:
-                    ans = RAG.offline_answer({'name': r['player'], 'rank': int(r['rank']), 'lo': int(r['rank_lo']), 'hi': int(r['rank_hi']), 'starter': srow['player'], 'club': club,
-                                              'role_s': sc['role_s'], 'role_c': sc['role_c'], 'pros': sc['pros'], 'cons': sc['cons'], 'keeps': sc['keeps'], 'down': sc['down'], 'adds': sc['adds'],
-                                              'price': (eur(r['value']), eur(srow.get('value', np.nan))), 'age': (float(r['age']), float(srow['age'])), 'vs1': sc['vs1'], 'style': sc['style'],
-                                              'dims': [(d, FB.tier(sc['dims_s'][d]), FB.tier(sc['dims_c'].get(d, np.nan))) for d in sc['dims_s']],
-                                              'reads': [f"{n_} ({t.lower()}): {s_}" for p_, n_ in ((sid, srow['player']), (int(cid), r['player'])) if rt_year(p_) is not None for t, s_ in RT.outliers(int(p_), rt_year(p_), 2)],
-                                              'hs': H.line(sc['hs'], r['player']) if sc['hs'] else None, 'top3': [f'No. {k} ' + H.line(h, n) for n, k, h in sc['top3']], 'question': q})
-                    st.markdown(ans)
-                with st.expander('Notes this answer drew on'):
-                    for p_ in passages: st.markdown(f"**{p_['title']}** (match {p_['score']:.2f})\n\n{p_['text']}")
-            hist.append((q, ans, passages))
-        if not key: st.caption('Free-form answers need a Gemini API key from Google AI Studio (the key Antigravity uses) in the app secrets as GEMINI_API_KEY. Without one you get the built-in scout report, built from the same numbers.')
+    tab2 = st.container()   # the scout's report (the free-form Ask why chat was removed)
     with tab2:
         verdict = (f"Top of the list to replace {srow['player']}." if int(r['rank']) == 1 else f"No. {int(r['rank'])} on the list to replace {srow['player']}" + (f"; No. 1 is {sc['vs1'][0]}." if sc['vs1'] else '.'))
         st.html(f'<div class="big">{r["player"]}<small>{sc["role_c"][0].upper() + sc["role_c"][1:]}. {verdict}</small></div>'
@@ -357,9 +347,9 @@ def explain_block(r, cid):
             st.html(f'<div class="disp" style="font:600 19px Barlow Condensed;color:{GOLD}">Why him</div>' + li([p[0].upper() + p[1:] for p in sc['pros']], 'No single reason stands out.')
                     + (f'<div class="disp" style="font:600 19px Barlow Condensed;color:{MUTE};margin-top:10px">Question marks</div>' + li([c[0].upper() + c[1:] for c in sc['cons']], '') if sc['cons'] else '')
                     + (f'<div class="note" style="margin-top:10px">Why {sc["vs1"][0]} is No. 1 instead: ' + (', and '.join(sc['vs1'][1]) if sc['vs1'][1] else 'small margins across several factors') + '.</div>' if sc['vs1'] else ''))
-        reads = [(n_, t, s_) for p_, n_ in ((sid, srow['player']), (int(cid), r['player'])) if rt_year(p_) is not None for t, s_ in RT.outliers(int(p_), rt_year(p_))]
-        if reads:
-            st.html(f'<div class="disp" style="font:600 19px Barlow Condensed;color:{GOLD};margin-top:6px">Style read: what the numbers mean in their teams</div>' + ''.join(f'<div class="note" style="margin-top:6px"><b style="color:{CHALK}">{n_}</b> <span class="tag">{t}</span>{s_}</div>' for n_, t, s_ in reads))
+        rh = reads_html(sid, srow['player']) + reads_html(int(cid), r['player'])
+        if rh:
+            st.html(f'<div class="disp" style="font:600 19px Barlow Condensed;color:{GOLD};margin-top:6px">Style read: what the numbers mean in their teams</div>' + rh)
         k1, k2, k3 = st.columns(3)
         k1.html(f'<div class="disp" style="font:600 19px Barlow Condensed;color:{CHALK}">Keeps what you lose</div>' + li(sc['keeps'][:5], 'None of the starter\'s strengths is matched like for like.'))
         k2.html(f'<div class="disp" style="font:600 19px Barlow Condensed;color:{CHALK}">Step down</div>' + li(sc['down'][:5], 'No clear drop-off in any area.'))
@@ -450,8 +440,8 @@ if view == 'Squad':
             r1, r2 = st.columns(2)
             r1.html(f'<div class="big" style="color:{GOLD}">{rr["rating_adj"]:.0f}<small>rating adjusted for team style{when}</small></div>')
             r2.html(f'<div class="big">{rr["rating_raw"]:.0f}<small>raw rating (per-90 percentiles only)</small></div>')
-            tw = SR.StyleRatings.team_words(rr); reads = RT.outliers(sid, ys)
-            st.html((f'<div class="note" style="margin-top:8px">{rr["squad"]} {tw}.</div>' if tw else '') + ''.join(f'<div class="note" style="margin-top:6px"><span class="tag">{t}</span>{s_}</div>' for t, s_ in reads))
+            tw = SR.StyleRatings.team_words(rr)
+            st.html((f'<div class="note" style="margin-top:8px">{rr["squad"]} {tw}.</div>' if tw else '') + reads_html(sid))
         if live: st.html(f'<div class="note" style="margin-top:14px">Departure risk <b style="color:{GOLD}">{srow["risk"]:.0%}</b>. Contract until {srow["contract_until"] if pd.notna(srow["contract_until"]) else "unknown"} (shown for context; the risk model does not use it, because past contract dates are not in the data).</div>')
         else:
             real = EV[(EV['t'] == int(season)) & (EV['S'] == sid)]

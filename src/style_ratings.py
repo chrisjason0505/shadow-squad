@@ -40,9 +40,13 @@ def _design(D):
 class StyleRatings:
     def __init__(self, F, T, min_minutes=900):
         T = T.copy(); T['x_poss'] = (T['possession'] - 50) / 10; T['x_press'] = -T['z_ppda']
-        keep = ['squad', 'yr', 'possession', 'ppda', 'xga_pm', 'deep_allowed_pm', 'z_xga_pm', 'z_possession', 'z_ppda', 'rank_xga', 'n_teams', 'x_poss', 'x_press', 'tackles_pm', 'interceptions_pm', 'pts_pm', 'z_long_balls_pm', 'z_xg_pm']
+        keep = ['squad', 'yr', 'possession', 'ppda', 'xga_pm', 'deep_allowed_pm', 'z_xga_pm', 'z_possession', 'z_ppda', 'rank_xga', 'n_teams', 'league', 'x_poss', 'x_press', 'tackles_pm', 'interceptions_pm', 'pts_pm', 'z_long_balls_pm', 'z_xg_pm']
         F = F.drop(columns=[c for c in ('possession',) if c in F]).copy()
         P = F[['player_id', 'player', 'yr', 'squad', 'comp', 'fine_pos', 'min_num'] + [m + '_p90raw' for m in FB.MET_BT]].merge(T[[c for c in keep if c in T]], on=['squad', 'yr'], how='left')
+        if {'long_balls_pm', 'passes_pm'} <= set(T.columns):     # directness: share of passes that are long, against the league that season
+            d = T[['squad', 'yr', 'league']].assign(direct=T['long_balls_pm'] / T['passes_pm'])
+            d['z_direct'] = d.groupby(['league', 'yr'])['direct'].transform(lambda x: (x - x.mean()) / x.std(ddof=0) if x.notna().sum() > 3 else np.nan)
+            P = P.merge(d[['squad', 'yr', 'direct', 'z_direct']], on=['squad', 'yr'], how='left')
         P[STYLE_X] = P[STYLE_X].fillna(0.0); ok = P['min_num'] >= min_minutes; self.coef = {}
         for m in FB.MET_BT:
             c = m + '_p90raw'; x = P[c].astype(float); eps = max(float(x[ok & (x > 0)].median() or 0) * 0.1, 1e-3) if (ok & (x > 0)).any() else 1e-3
@@ -59,6 +63,11 @@ class StyleRatings:
             P.loc[ok, m + '_pct_raw'] = P[ok].groupby(['yr', 'fine_pos'])[c].rank(pct=True) * 100
             P.loc[ok, m + '_pct_adj'] = P[ok].groupby(['yr', 'fine_pos'])[m + '_adj'].rank(pct=True) * 100
         P['team_def_pct'] = 100 * (1 - (P['rank_xga'] - 1) / (P['n_teams'] - 1).clip(lower=1))
+        for m in ('prgp', 'kp', 'npxg', 'sca', 'aer_won'):
+            tot = P[m + '_p90raw'] * P['min_num'] / 90
+            if m == 'aer_won': continue
+            P['share_' + m] = tot / tot.groupby([P['squad'], P['yr']]).transform('sum')
+            P['rank_' + m] = tot.groupby([P['squad'], P['yr']]).rank(ascending=False, method='min')
         self.P = P.set_index(['player_id', 'yr']); self.ok = ok.to_numpy()
         self._rate()
 
@@ -97,59 +106,104 @@ class StyleRatings:
         rk, n = r['rank_xga'], r['n_teams']; d = f"conceded {r['xga_pm']:.2f} xG a game" + (f", the best defence in the league" if rk == 1 else f", the {FB_ord(int(rk))} best in the league" if rk <= 5 else f", {FB_ord(int(rk))} of {int(n)}" if np.isfinite(rk) else '')
         return f"{ball} ({p:.0f}% possession), {pr} (PPDA {r['ppda']:.1f}) and {d}"
 
-    def outliers(self, pid, yr, k=3):
-        """Style-based outliers, strongest first: [(tag, sentence)]. Each archetype pairs what the team's style asks for
-        (or makes hard) with what the player still does. Ball-winning stands in for pressing work: the bundled FBref
-        tables have tackles won and interceptions but not the pressures count, which FBref dropped."""
+    # ---- the football reading: categorised style reads with the numbers behind them ----
+    CATS = ('Changes the team\'s dynamic', 'Focal point', 'Defensive intelligence', 'Role note')
+
+    def reads(self, pid, yr, k=4):
+        """Style reads, strongest first: [{'cat', 'tag', 'text', 'ev': [(label, value)], 'score'}].
+        Changes the team's dynamic: does what his team's style does not ask for, or makes hard.
+        Focal point: the team leans on him (his share of the regulars' output, or the job the style hands him).
+        Defensive intelligence: defends well in ways tackle counts miss (position, a high line, a tight defence).
+        Role note: a neutral read of how he plays in the system.
+        Ball-winning stands in for pressing work: the FBref tables have tackles won and interceptions, not pressures.
+        Team shares are among the squad's regulars (900+ league minutes)."""
         r = self.get(pid, yr)
         if r is None: return []
-        pos = r['fine_pos']; club = r['squad']; P = FB.POS.get(pos, pos); out = []
-        poss = r.get('possession', np.nan); press = r.get('x_press', np.nan); zlong = r.get('z_long_balls_pm', np.nan); zxg = r.get('z_xg_pm', np.nan)
+        pos = r['fine_pos']; club = r['squad']; P = FB.POS.get(pos, pos); PL = FB.POS_PL.get(pos, 'players'); out = []
+        poss = r.get('possession', np.nan); press = r.get('x_press', np.nan); zlong = r.get('z_direct', np.nan); zxg = r.get('z_xg_pm', np.nan); zx = r.get('z_xga_pm', np.nan)
+        ok = lambda *v: all(v_ is not None and np.isfinite(v_) for v_ in v)
         pct = lambda ms: np.nanmean([r[m + '_pct_raw'] for m in ms]) if any(np.isfinite(r[m + '_pct_raw']) for m in ms) else np.nan
         sup = lambda ms: np.nanmean([r[m + '_surp'] for m in ms]) if any(np.isfinite(r[m + '_surp']) for m in ms) else np.nan
-        ok = lambda *v: all(np.isfinite(x) for x in v)
-        win, drib, threat, create, prog = pct(['tklw', 'int']), pct(['take_on', 'prgc']), pct(['npxg', 'gls', 'sh']), pct(['kp', 'sca', 'ppa', 'ast']), pct(['prgp', 'prgc'])
-        PL = FB.POS_PL.get(pos, 'players'); ppda = f"PPDA {r['ppda']:.1f}" if ok(r.get('ppda', np.nan)) else 'a high press'
-        # 1. two-way player in a high-octane pressing side
+        top = lambda p: f"top {max(1, round(100 - p))}%"
+        per = lambda m: f"{r[m + '_p90raw']:.2f} per 90 ({FB_ord(int(round(r[m + '_pct_raw'])))} pct)" if ok(r[m + '_p90raw'], r[m + '_pct_raw']) else 'n/a'
+        T = [('Team possession', f"{poss:.0f}%")] if ok(poss) else []
+        if ok(r.get('ppda', np.nan)): T.append(('Team PPDA (lower = harder press)', f"{r['ppda']:.1f}"))
+        def add(cat, tag, score, text, ev): out.append({'cat': cat, 'tag': tag, 'score': float(score), 'text': text, 'ev': ev})
+        win, drib, threat, create, prog, aer = pct(['tklw', 'int']), pct(['take_on', 'prgc']), pct(['npxg', 'gls', 'sh']), pct(['kp', 'sca', 'ppa', 'ast']), pct(['prgp', 'prgc']), pct(['aer_won'])
+        sh = lambda m: r.get('share_' + m, np.nan); rk = lambda m: r.get('rank_' + m, np.nan)
+        def share_ev(m, label):
+            return (f'Share of team {label}', f"{sh(m):.0%}, {FB_ord(int(rk(m)))} in the squad") if ok(sh(m), rk(m)) else (f'Team {label}', 'n/a')
+        D = "Changes the team's dynamic"; FP = 'Focal point'; DI = 'Defensive intelligence'
+
+        # ---------- changes the team's dynamic ----------
         if pos in ('W', 'AM', 'CM', 'ST', 'FB') and ok(press, win, drib) and press >= 0.7 and win >= 65 and drib >= 70:
-            out.append(((win + drib) / 50, 'Two-way engine in a pressing side', f"{club} pressed as hard as anyone ({ppda}), which drains attackers, yet he is in the top {100 - win:.0f}% of {PL} for winning the ball back and the top {100 - drib:.0f}% for dribbles and carries. Most players in a system like that give up one side of the game; he keeps both."))
+            add(D, 'Two-way engine in a pressing side', 2 + (win + drib) / 100, f"{club} pressed as hard as anyone, which drains attackers, yet he is {top(win)} of {PL} for winning the ball back and {top(drib)} for dribbles and carries. Most players in that system give up one side of the game; he keeps both.",
+                T[1:] + [('Tackles won', per('tklw')), ('Interceptions', per('int')), ('Dribbles completed', per('take_on')), ('Progressive carries', per('prgc'))])
         if pos in ('ST', 'W', 'AM') and ok(press, win, threat) and press >= 0.7 and win >= 70 and threat >= 70:
-            out.append(((win + threat) / 50, 'Presses and still scores', f"Leads the press in a high-intensity side ({ppda}), top {100 - win:.0f}% of {PL} for ball-winning, and still top {100 - threat:.0f}% for goal threat."))
-        # 2. risk-taker in a deep side
-        for d, ms, word in (('Creation', ['kp', 'sca', 'ppa', 'ast'], 'chance creation'), ('Progression', ['prgp', 'prgc', 'take_on'], 'ball progression')):
+            add(D, 'Presses and still scores', 2 + (win + threat) / 100, f"Leads the press in a high-intensity side ({top(win)} of {PL} for ball-winning) and is still {top(threat)} for goal threat.", T[1:] + [('Tackles won', per('tklw')), ('Non-penalty xG', per('npxg')), ('Goals', per('gls'))])
+        for ms, word in ((['kp', 'sca', 'ppa', 'ast'], 'chance creation'), (['prgp', 'prgc', 'take_on'], 'ball progression')):
             sv = sup(ms)
             if ok(sv, poss) and sv >= 1.2 and poss <= 46:
-                out.append((sv + 1.5, 'Risk-taker in a deep side', f"{club} had only {poss:.0f}% of the ball, yet his {word} is {sv:+.1f} standard deviations above what that style predicts. He keeps trying the difficult pass instead of the safe one; the team's attacking play runs through him."))
-                break
-        # 3. direct dribbler in a patient possession side
+                add(D, 'Risk-taker in a deep side', 1.5 + sv, f"{club} had only {poss:.0f}% of the ball, yet his {word} is far above what that style predicts. He keeps trying the difficult pass instead of the safe one, and the team's attacking play runs through him.",
+                    T[:1] + [(f'{word.capitalize()} vs what the style predicts', f"{sv:+.1f} sd")] + [(FB.MET_BT[m].capitalize(), per(m)) for m in ms[:3]]); break
         sv = sup(['take_on', 'prgc'])
         if pos in ('W', 'AM', 'CM', 'FB', 'ST') and ok(sv, poss) and poss >= 56 and sv >= 1.0:
-            out.append((sv + 1.2, 'Direct runner in a patient side', f"{club} built slowly with {poss:.0f}% of the ball, a style that recycles possession rather than running with it, yet he beats men and carries forward {sv:+.1f} sd more than that predicts. He is the one who breaks the pattern."))
-        # 4. creative hub in a direct, long-ball side
+            add(D, 'Direct runner in a patient side', 1.2 + sv, f"{club} built slowly with {poss:.0f}% of the ball, a style that recycles possession rather than running with it. He beats men and carries forward far more than that predicts, so he is the one who breaks the pattern.",
+                T[:1] + [('Dribbles and carries vs style', f"{sv:+.1f} sd"), ('Dribbles completed', per('take_on')), ('Progressive carries', per('prgc'))])
         sv = sup(['kp', 'prgp', 'ppa'])
         if ok(sv, zlong) and zlong >= 1.0 and sv >= 1.2:
-            out.append((sv + 1.0, 'Playmaker in a direct side', f"{club} went long more than most, which bypasses midfield, yet his creative and progressive passing is {sv:+.1f} sd above what that style predicts. The ball goes through him when they do play."))
-        # 5. carries a low-xG attack
-        best = max((v for v in (threat, create) if np.isfinite(v)), default=np.nan)
-        if pos in ('ST', 'W', 'AM', 'CM') and ok(zxg, best) and zxg <= -0.7 and best >= 80:
-            out.append((best / 40, 'Carries a blunt attack', f"{club} created little as a team (xG per game well below the league average), yet he is in the top {100 - best:.0f}% of {PL} for " + ('goal threat' if best == threat else 'chance creation') + '. Take him out and there is not much left.'))
-        # 6. ball-playing defender in a deep side
+            add(D, 'Playmaker in a direct side', 1.0 + sv, f"{club} went long more than most, which bypasses midfield, yet his creative and progressive passing is far above what that style predicts. When they do play through the thirds, it goes through him.",
+                [('Long balls as a share of passes', f"{r['direct']:.0%} ({zlong:+.1f} sd vs league)"), ('Passing vs style', f"{sv:+.1f} sd"), ('Key passes', per('kp')), ('Progressive passes', per('prgp'))])
         if pos in ('CB', 'FB') and ok(prog, poss) and poss <= 47 and prog >= 75:
-            out.append((prog / 40, 'Ball-player in a deep side', f"A {P} who is top {100 - prog:.0f}% for progressive passes and carries in a side with only {poss:.0f}% of the ball, where defenders are usually told to clear it."))
-        # 7. front-foot defender in a side that has the ball
+            add(D, 'Ball-player in a deep side', 1 + prog / 50, f"A {P} who is {top(prog)} for progressive passes and carries in a side with only {poss:.0f}% of the ball, where defenders are usually told to clear it.", T[:1] + [('Progressive passes', per('prgp')), ('Progressive carries', per('prgc'))])
         sv = sup(['tklw', 'int', 'blocks'])
         if pos in ('CB', 'FB', 'DM', 'CM') and ok(sv, poss) and sv >= 1.2 and poss >= 55:
-            out.append((sv + 1.0, 'Front-foot defender', f"{club} had {poss:.0f}% of the ball, so there was little defending to do, yet he made far more defensive actions than that predicts ({sv:+.1f} sd). He hunts the ball rather than waiting for it."))
-        # 8. positionally sound defender in a tight defence
-        raw = self._dept(r, 'raw'); adj = self._dept(r, 'adj')
-        if pos in ('CB', 'FB', 'DM') and r['min_num'] >= MIN_STARTER and ok(raw.get('Defending', np.nan), r['z_xga_pm']) and raw['Defending'] < 40 and r['z_xga_pm'] <= -1.0:
-            out.append((3.0 - r['z_xga_pm'] / 2, 'Positionally sound', f"Few tackles and interceptions on paper ({FB_ord(int(round(raw['Defending'])))} percentile raw), but {club} conceded only {r['xga_pm']:.2f} xG a game with him playing {int(r['min_num']):,} minutes" + (", the best defence in the league" if r['rank_xga'] == 1 else f", the {FB_ord(int(r['rank_xga']))} best in the league") +
-                        f". A defender in a side like that is rarely exposed: low numbers point to positioning and reading the game, not a weak defender. Adjusted for possession his defending is {FB_ord(int(round(adj['Defending'])))} percentile."))
-        # 9. keeps it simple (the one negative read)
+            add(D, 'Front-foot defender', 1.0 + sv, f"{club} had {poss:.0f}% of the ball, so there was little defending to do, yet he made far more defensive actions than that predicts. He steps in and hunts the ball rather than waiting for it.", T[:1] + [('Defending vs style', f"{sv:+.1f} sd"), ('Tackles won', per('tklw')), ('Interceptions', per('int'))])
+
+        # ---------- focal point ----------
+        if pos in ('CB', 'FB') and ok(sh('prgp'), rk('prgp')) and rk('prgp') <= 2 and sh('prgp') >= 0.14 and r['min_num'] >= MIN_STARTER:
+            add(FP, 'Starts the attacks', 2 + 5 * sh('prgp'), f"The {P} {club} build through: {'more' if rk('prgp') == 1 else 'the second most'} progressive passes of anyone in the squad. Taking responsibility on the ball from {'centre-back' if pos == 'CB' else 'full-back' if pos == 'FB' else 'the base of midfield'} is a job most teams give to a midfielder.",
+                [share_ev('prgp', 'progressive passes'), ('Progressive passes', per('prgp')), ('Passes into the box', per('ppa'))] + T[:1])
+        if pos == 'ST' and ok(aer) and aer >= 75 and ok(zlong) and zlong >= 0.3:
+            add(FP, 'Target man', 1.5 + aer / 100 + zlong / 2, f"{club} went long more than most, and he is the outlet: {top(aer)} of strikers for aerial duels won. The direct game only works if the ball sticks up front.",
+                [('Aerial duels won', f"{r['aer_won_p90raw']:.0f}% ({FB_ord(int(round(aer)))} pct)"), ('Long balls as a share of passes', f"{r['direct']:.0%} ({zlong:+.1f} sd vs league)"), share_ev('npxg', 'non-penalty xG')])
+        elif pos == 'ST' and ok(aer) and aer >= 90:
+            add(FP, 'Wins everything in the air', 1.2 + aer / 100, f"{top(aer)} of strikers for aerial duels won: a reference point for crosses and clearances alike.", [('Aerial duels won', f"{r['aer_won_p90raw']:.0f}% ({FB_ord(int(round(aer)))} pct)")])
+        if pos in ('ST', 'W', 'AM') and ok(sh('npxg'), rk('npxg')) and rk('npxg') == 1 and sh('npxg') >= 0.30:
+            add(FP, 'The goal threat', 1.5 + 3 * sh('npxg'), f"{sh('npxg'):.0%} of the non-penalty xG among {club}'s regulars came through him: take him out and the chances dry up.", [share_ev('npxg', 'non-penalty xG'), ('Non-penalty xG', per('npxg')), ('Shots', per('sh'))])
+        if pos in ('AM', 'W', 'CM', 'FB') and ok(sh('kp'), rk('kp')) and rk('kp') == 1 and sh('kp') >= 0.22:
+            add(FP, 'Creative hub', 1.4 + 3 * sh('kp'), f"The main creator: {sh('kp'):.0%} of the key passes among {club}'s regulars.", [share_ev('kp', 'key passes'), ('Key passes', per('kp')), ('Shot-creating actions', per('sca'))])
+        best = max((v for v in (threat, create) if np.isfinite(v)), default=np.nan)
+        if pos in ('ST', 'W', 'AM', 'CM') and ok(zxg, best) and zxg <= -0.7 and best >= 80:
+            add(FP, 'Carries a blunt attack', 1 + best / 50, f"{club} created little as a team, yet he is {top(best)} of {PL} for " + ('goal threat' if best == threat else 'chance creation') + '. Take him out and there is not much left.',
+                [('Team xG per game (vs league)', f"{zxg:+.1f} sd"), ('Non-penalty xG', per('npxg')), ('Key passes', per('kp'))])
+
+        # ---------- defensive intelligence ----------
+        raw = self._dept(r, 'raw'); adj = self._dept(r, 'adj'); starter = r['min_num'] >= MIN_STARTER
+        xga_ev = ('Team xG against', f"{r['xga_pm']:.2f} a game, {FB_ord(int(r['rank_xga']))} of {int(r['n_teams'])}") if ok(r.get('xga_pm', np.nan), r.get('rank_xga', np.nan)) else ('Team xG against', 'n/a')
+        high_line = ok(poss, press) and poss >= 54 and press >= 0.5
+        if pos in ('CB', 'FB') and starter and high_line and ok(zx, r.get('rank_xga', np.nan)) and zx <= -0.9 and r['rank_xga'] <= 4:
+            add(DI, 'Holds a high line', 2.6 - zx / 2, f"{club} pressed high with {poss:.0f}% of the ball, which leaves space in behind, and still conceded very little with him playing {int(r['min_num']):,} minutes. Defending that much grass takes recovery pace, timing and the reading of when to step up.",
+                T + [xga_ev, ('Interceptions', per('int')), ('Aerial duels won', f"{r['aer_won_p90raw']:.0f}%" if ok(r['aer_won_p90raw']) else 'n/a')])
+        if pos in ('CB', 'FB', 'DM') and starter and ok(raw.get('Defending', np.nan), zx) and raw['Defending'] < 40 and zx <= -1.0:
+            add(DI, 'Positionally sound', 2.5 - zx / 2, f"Few tackles and interceptions on paper, but {club} conceded only {r['xga_pm']:.2f} xG a game with him playing {int(r['min_num']):,} minutes. A defender in a side like that is rarely exposed: low numbers point to positioning and reading the game, not a weak defender.",
+                [xga_ev, ('Defending (raw)', f"{FB_ord(int(round(raw['Defending'])))} pct"), ('Defending (possession-adjusted)', f"{FB_ord(int(round(adj['Defending'])))} pct")] + T[:1])
+        if pos in ('CB', 'FB', 'DM') and starter and ok(zx, raw.get('Defending', np.nan)) and zx <= -0.8 and raw['Defending'] >= 70:
+            add(DI, 'Anchor of a tight defence', 1.8 - zx / 2, f"Busy and effective: {top(raw['Defending'])} of {PL} for defensive actions in one of the tightest defences in the league.", [xga_ev, ('Tackles won', per('tklw')), ('Interceptions', per('int')), ('Blocks', per('blocks'))])
+
+        # ---------- role note ----------
         sv = sup(['kp', 'prgp', 'ppa'])
         if pos in ('CB', 'FB', 'DM', 'CM') and ok(sv, poss) and sv <= -1.3 and poss >= 55:
-            out.append((-sv, 'Keeps it simple', f"His creative and progressive passing is well below what a side with {poss:.0f}% of the ball predicts ({sv:+.1f} sd): a safe, low-risk passer in a team that gives him the ball."))
-        return [(t, s_) for _, t, s_ in sorted(out, key=lambda x: -x[0])[:k]]
+            add('Role note', 'Keeps it simple', 0.5 - sv / 3, f"His creative and progressive passing is well below what a side with {poss:.0f}% of the ball predicts: a safe, low-risk passer in a team that gives him the ball.", T[:1] + [('Passing vs style', f"{sv:+.1f} sd")])
+        out.sort(key=lambda x: -x['score']); seen = set(); res = []
+        for x in out:
+            if x['tag'] in seen: continue
+            seen.add(x['tag']); res.append(x)
+        return res[:k]
+
+    def outliers(self, pid, yr, k=3):
+        """[(tag, sentence)] for compact places (tags, dossier lines)."""
+        return [(x['tag'], x['text'] + ' (' + '; '.join(f'{a}: {b}' for a, b in x['ev']) + ')') for x in self.reads(pid, yr, k)]
 
 
 def FB_ord(n):
