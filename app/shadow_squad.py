@@ -13,6 +13,7 @@ st.html(f"""<style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&display=swap');
 html, body, [class*="st-"], .stMarkdown p {{ font-family: 'Barlow', sans-serif; }}
 [data-testid="stIconMaterial"], [data-testid="stExpanderToggleIcon"] {{ font-family: 'Material Symbols Rounded' !important; }}
+[data-stale="true"] {{ opacity: 1 !important; transition: none !important; }}
 .block-container {{ padding-top: 2.2rem; max-width: 1280px; }}
 h1, h2, h3, .disp {{ font-family: 'Barlow Condensed', sans-serif; letter-spacing: .01em; }}
 .mast {{ display:flex; align-items:baseline; gap:18px; border-bottom:2px solid {GOLD}; padding-bottom:10px; margin-bottom:6px; }}
@@ -55,8 +56,17 @@ lake, models, EV, SQ, SL, VH = load(); F = lake.F
 def ratings():
     """Style-adjusted ratings and outlier reads (src/style_ratings.py), or None without lake/team_style.parquet."""
     p = L('team_style.parquet')
-    return SR.StyleRatings(F, pd.read_parquet(p)) if os.path.exists(p) else None
+    dx = L('defence_ext.parquet')
+    return SR.StyleRatings(F, pd.read_parquet(p), DX=pd.read_parquet(dx) if os.path.exists(dx) else None) if os.path.exists(p) else None
 RT = ratings()
+
+
+@st.cache_resource
+def ext():
+    """Defending, pressing and aerial numbers per player-season (src/build_defence.py), or None."""
+    p = L('defence_ext.parquet')
+    return FB.ext_table(pd.read_parquet(p)) if os.path.exists(p) else None
+XT = ext()
 
 
 def rt_year(pid):
@@ -100,7 +110,7 @@ eur = lambda v: '-' if pd.isna(v) else (f'EUR {v / 1e6:.1f}m' if v < 1e7 else f'
 # ---------------- masthead and controls ----------------
 seasons = (['live'] if SQ is not None else []) + sorted(F.loc[F['elite_club'], 'yr'].unique().tolist(), reverse=True)
 LEAGUE_ORDER = ['Premier League', 'La Liga', 'Bundesliga', 'Serie A', 'Ligue 1']
-c1, c2, c3, c4 = st.columns([1.15, 1.05, 1.35, 2.2]); season = pick('Season', seasons, 'season', lambda s: 'Now (after 2025-26)' if s == 'live' else f'{s}-{str(int(s) + 1)[2:]} (backtest)', c1); live = season == 'live'
+c1, c2, c3, c5, c4 = st.columns([0.95, 0.9, 1.1, 1.25, 2.6]); season = pick('Season', seasons, 'season', lambda s: 'Now (after 2025-26)' if s == 'live' else f'{s}-{str(int(s) + 1)[2:]} (backtest)', c1); live = season == 'live'
 if live: pool_sq = SQ.rename(columns={'name': 'player', 'age_today': 'age'}).assign(comp=lambda d: d['league'], left=np.nan)
 else:
     t = int(season); pool_sq = F[(F['yr'] == t) & (F['min_num'] >= MID['ELITE_MIN_MIN'])].rename(columns={'age_num': 'age', 'min_num': 'minutes'}).copy()
@@ -118,7 +128,10 @@ st.html(f"""<div class="mast"><span class="name">{club}</span><span class="sub">
 <span class="badge {'live' if live else 'back'}">{'Live: data to July 2026' if live else f'Backtest {season}-{str(int(season) + 1)[2:]}'}</span></div>""")
 if live: st.html(f'<div class="note">Live shortlists are precomputed for the top clubs only ({SQ["club"].nunique()} across the five leagues, {len(clubs)} in {league}). Pick a past season to see every club in the league.</div>')
 elif club not in elite: st.html('<div class="note">The ranking models learned from signings by top clubs. For this club, read the list as players who fit the profile and price of the starter, not as a forecast of what the club will do.</div>')
-squad = squad.sort_values('minutes', ascending=False).head(14); sid = qp.get('starter'); sid = int(sid) if sid and sid.isdigit() and int(sid) in set(squad['player_id']) else int(squad.sort_values('risk', ascending=False)['player_id'].iat[0])
+squad = squad.sort_values('minutes', ascending=False).head(14)
+if not (qp.get('starter') or '').isdigit() or int(qp.get('starter')) not in set(squad['player_id']): qp['starter'] = str(int(squad.sort_values('risk', ascending=False)['player_id'].iat[0]))
+_pl = squad.sort_values(['fine_pos', 'minutes'], ascending=[True, False]); _nm = dict(zip(_pl['player_id'], _pl['player'] + ' (' + _pl['fine_pos'] + ')'))
+sid = int(pick('Player', _pl['player_id'].tolist(), 'starter', lambda i: _nm.get(i, str(i)), c5))
 srow = squad[squad['player_id'] == sid].iloc[0]
 
 
@@ -137,7 +150,7 @@ def shortlist(live, club, season, sid):
     for j, f in enumerate(E.FEATS): X['shap_' + f] = ex.values[:, j]
     X['why'] = why; X['patterns'] = [f"Matches {int(a)} of the {int(b)} maximal trait profiles past signings at this position had: {c}" if pd.notna(a) and a > 0 else '' for a, b, c in zip(X.get('n_maximal_matched', np.nan), X.get('n_maximal_total', np.nan), X.get('maximal_matched', ''))]
     X['age'] = X['age_num']; X['ref_value'] = X['S_value']; return X
-X = shortlist(live, club, season, sid)
+with st.spinner(f'Finding the ideal fit to replace {srow["player"]}...'): X = shortlist(live, club, season, sid)
 
 
 def pitch(squad, sel, formation='auto'):
@@ -397,17 +410,20 @@ def heat(p):
 
 def matrix_html(cols, data, pos, live, show_raw, tags=None):
     """Departments x metrics against the starter and his replacements. cols: [(pid, header html)]; data: {pid: {metric: (pct, per90, season)}}."""
-    depts = FB.DEPT_LIVE if live else FB.DEPT_BT; order = [d for d in FB.DEPT_ORDER.get(pos, list(depts)) if d in depts] + [d for d in depts if d not in FB.DEPT_ORDER.get(pos, [])]
-    names = FB.MET_LIVE if live else FB.MET_BT; s0 = cols[0][0]; th = 'padding:8px 10px;font:600 14px Barlow Condensed;color:' + CHALK
+    depts = FB.DEPT_MX_LIVE if live else FB.DEPT_MX_BT
+    if XT is None: depts = {d: [m for m in ms if m in (FB.MET_LIVE if live else FB.MET_BT)] for d, ms in depts.items()}
+    depts = {d: [m for m in ms if any(np.isfinite(data.get(pid, {}).get(m, (np.nan,))[0]) for pid, _ in cols)] for d, ms in depts.items()}; depts = {d: ms for d, ms in depts.items() if ms}
+    order = [d for d in FB.DEPT_MX_ORDER.get(pos, list(depts)) if d in depts] + [d for d in depts if d not in FB.DEPT_MX_ORDER.get(pos, [])]
+    names = {**(FB.MET_LIVE if live else FB.MET_BT), **FB.MET_EXT}; s0 = cols[0][0]; th = 'padding:8px 10px;font:600 14px Barlow Condensed;color:' + CHALK
     h = ['<div style="overflow-x:auto"><table style="border-collapse:separate;border-spacing:2px;width:100%;font-family:Barlow;font-size:13px">',
          f'<tr><th style="{th};text-align:left">Department / metric (per 90)</th>' + ''.join(f'<th style="{th};text-align:center;min-width:92px;{"border-bottom:2px solid " + CHALK if i == 0 else ""}">{c}</th>' for i, (_, c) in enumerate(cols)) + '</tr>']
     for d in order:
-        ms = depts[d]; avg = {pid: np.nanmean([data[pid][m][0] for m in ms]) if any(np.isfinite(data[pid][m][0]) for m in ms) else np.nan for pid, _ in cols}
+        ms = depts[d]; avg = {pid: np.nanmean([data[pid].get(m, (np.nan,))[0] for m in ms]) if any(np.isfinite(data[pid].get(m, (np.nan,))[0]) for m in ms) else np.nan for pid, _ in cols}
         h.append(f'<tr><td style="padding:9px 10px 5px;font:600 16px Barlow Condensed;color:{GOLD}">{d}</td>' + ''.join(f'<td style="{heat(avg[pid])};text-align:center;font:600 15px Barlow Condensed;border-radius:3px">{"" if not np.isfinite(avg[pid]) else f"{avg[pid]:.0f}"}' + (f' <span style="font-size:11px">{UP if avg[pid] - avg[s0] >= 10 else DN if avg[pid] - avg[s0] <= -10 else ""}</span>' if pid != s0 and np.isfinite(avg[pid]) and np.isfinite(avg[s0]) else '') + '</td>' for pid, _ in cols) + '</tr>')
         for m in ms:
             cells = []
             for pid, _ in cols:
-                pc, raw, yr = data[pid][m]; txt = '-' if not np.isfinite(pc) else ((f'{raw:.0f}%' if m == 'aer_won' else f'{raw:.2f}') if show_raw and np.isfinite(raw) else f'{pc:.0f}')
+                pc, raw, yr = data[pid].get(m, (np.nan, np.nan, None)); txt = '-' if not np.isfinite(pc) else ((f'{raw:.0f}%' if m in ('aer_won', 'aer_pct', 'chal_pct') else f'{raw:.2f}') if show_raw and np.isfinite(raw) else f'{pc:.0f}')
                 sub = (f'<div style="font-size:10px;opacity:.75">{ordn(pc)} pct' + (f' {DOT} {yr}-{str(yr + 1)[2:]}' if yr is not None and show_raw else '') + '</div>') if show_raw and np.isfinite(pc) else ''
                 cells.append(f'<td style="{heat(pc)};text-align:center;padding:5px 4px;border-radius:2px">{txt}{sub}</td>')
             h.append(f'<tr><td style="padding:4px 10px 4px 22px;color:{MUTE}">{names.get(m, m)}</td>' + ''.join(cells) + '</tr>')
@@ -476,20 +492,28 @@ elif view == 'Compare':
         m1, m2 = st.columns(2); m1.html(f'<div class="big">{eur(r["value"])}<small>his market value</small></div>'); m2.html(f'<div class="big">{eur(r["ref_value"])}<small>the starter\'s</small></div>'); st.markdown('<div style="margin-top:18px">' + spark(int(cid)) + '</div>', unsafe_allow_html=True)
     st.divider(); explain_block(r, cid)
 elif view == 'Matrix':
-    m1, m2, m3 = st.columns([1.2, 1.4, 1.4]); n = m1.slider('Replacements to compare', 3, 10, 5, key='w_mn')
-    mode = 'This season' if live else (m2.segmented_control('Numbers', ['That season', 'Peak (best of last 3 seasons)'], default='That season', key='w_mpeak') or 'That season')
-    show = m3.segmented_control('Show', ['Percentile', 'Per 90 + percentile'], default='Per 90 + percentile' if not live else 'Percentile', key='w_mraw') or 'Percentile'
-    adjm = (st.segmented_control('Rate actions', ['Adjusted for team style', 'Raw'], default='Adjusted for team style', key='w_madj') or 'Adjusted for team style') if (RT is not None and not live) else 'Raw'
-    Xs = X.head(n); peak = mode.startswith('Peak')
-    if live:
-        ZL = [c for c in SL.columns if c.startswith('z_')]; s0 = SQ[SQ['player_id'] == sid]
-        data = FB.matrix_live(pd.concat([s0[['player_id'] + ZL], Xs[['player_id'] + ZL]]), ZL); show_raw = False
-    else:
-        data = FB.matrix_bt(pct_table('adj' if adjm.startswith('Adjusted') else 'raw'), [sid] + Xs['player_id'].tolist(), int(season), peak=peak); show_raw = show != 'Percentile'
-    cols = [(sid, f'{srow["player"]}<div style="font:400 11px Barlow;color:{MUTE}">leaving \u00b7 {eur(srow.get("value", np.nan))}</div>')] + [(int(x['player_id']), f'{int(x["rank"])}. {x["player"]}<div style="font:400 11px Barlow;color:{MUTE}">{x["squad"]} \u00b7 {eur(x["value"])}</div>') for _, x in Xs.iterrows()]
-    st.html(f'<div class="note" style="margin-bottom:8px">{srow["player"]} against the first {n} names on his shadow list, department by department, ordered by what matters most for a {FB.POS.get(srow["fine_pos"], "player")}. Each cell is the percentile among {FB.POS_PL.get(srow["fine_pos"], "players")} in the five leagues that season (900+ minutes)' + ('' if live else ', with the per-90 number above it') + '. Department rows average their metrics; \u25b2 / \u25bc mark a replacement 10+ points above or below the starter.' + (' Peak takes each player\'s best season of the last three for each metric, so it shows his ceiling rather than his latest form.' if peak else '') + (' Live numbers are Understat per-90s; percentiles are estimated from the standardised scores.' if live else ' ' + (' Numbers are adjusted for each team\'s possession (see below); a Style read row at the bottom flags style outliers.' if adjm.startswith('Adjusted') else ' These are the numbers the players actually posted at their clubs, before any style adjustment.') + '') + '</div>')
-    st.html(matrix_html(cols, data, srow['fine_pos'], live, show_raw, tags={pid: tags_html(pid, 2) for pid, _ in cols}))
-    if adjm.startswith('Adjusted'): st.html('<div class="note" style="margin-top:8px">Adjusted for team style: defensive actions are scaled up for players whose team had more of the ball (2 / (1 + e^(-0.1 x (possession - 50))), about x1.4 at 58%), and actions on the ball are scaled down by the square root of the same factor. Goal threat and aerial win rate are not adjusted. Per-90 numbers shown are the adjusted ones; switch to Raw for the originals.</div>')
+    @st.fragment
+    def matrix_view():
+        m1, m2, m3 = st.columns([1.2, 1.4, 1.4]); n = m1.slider('Replacements to compare', 3, 10, 5, key='w_mn')
+        mode = 'This season' if live else (m2.segmented_control('Numbers', ['That season', 'Peak (best of last 3 seasons)'], default='That season', key='w_mpeak') or 'That season')
+        show = m3.segmented_control('Show', ['Percentile', 'Per 90 + percentile'], default='Per 90 + percentile', key='w_mraw') or 'Percentile'
+        adjm = (st.segmented_control('Rate actions', ['Adjusted for team style', 'Raw'], default='Adjusted for team style', key='w_madj') or 'Adjusted for team style') if (RT is not None and not live) else 'Raw'
+        Xs = X.head(n); peak = mode.startswith('Peak')
+        if live:
+            ZL = [c for c in SL.columns if c.startswith('z_')]; s0 = SQ[SQ['player_id'] == sid]
+            data = FB.matrix_live(pd.concat([s0[['player_id'] + ZL], Xs[['player_id'] + ZL]]), ZL); show_raw = show != 'Percentile'
+            if XT is not None:
+                for pid_, d_ in FB.matrix_ext(XT, [sid] + Xs['player_id'].tolist(), None, latest=True).items(): data.setdefault(int(pid_), {}).update(d_)
+        else:
+            data = FB.matrix_bt(pct_table('adj' if adjm.startswith('Adjusted') else 'raw'), [sid] + Xs['player_id'].tolist(), int(season), peak=peak); show_raw = show != 'Percentile'
+            if XT is not None:
+                for pid_, d_ in FB.matrix_ext(XT, [sid] + Xs['player_id'].tolist(), int(season), peak=peak).items(): data[pid_].update(d_)
+        cols = [(sid, f'{srow["player"]}<div style="font:400 11px Barlow;color:{MUTE}">leaving \u00b7 {eur(srow.get("value", np.nan))}</div>')] + [(int(x['player_id']), f'{int(x["rank"])}. {x["player"]}<div style="font:400 11px Barlow;color:{MUTE}">{x["squad"]} \u00b7 {eur(x["value"])}</div>') for _, x in Xs.iterrows()]
+        st.html(f'<div class="note" style="margin-bottom:8px">{srow["player"]} against the first {n} names on his shadow list, department by department, ordered by what matters most for a {FB.POS.get(srow["fine_pos"], "player")}. Each cell is the percentile among {FB.POS_PL.get(srow["fine_pos"], "players")} in the five leagues that season (900+ minutes)' + ('' if live else ', with the per-90 number above it') + '. Department rows average their metrics; \u25b2 / \u25bc mark a replacement 10+ points above or below the starter.' + (' Peak takes each player\'s best season of the last three for each metric, so it shows his ceiling rather than his latest form.' if peak else '') + (' Live numbers are Understat per-90s; percentiles are estimated from the standardised scores.' if live else ' ' + (' Numbers are adjusted for each team\'s possession (see below); a Style read row at the bottom flags style outliers.' if adjm.startswith('Adjusted') else ' These are the numbers the players actually posted at their clubs, before any style adjustment.') + '') + '</div>')
+        st.html(matrix_html(cols, data, srow['fine_pos'], live, show_raw, tags={pid: tags_html(pid, 2) for pid, _ in cols}))
+        if XT is not None: st.html('<div class="note" style="margin-top:8px">Defending, Pressing and Aerial use the full FBref defensive tables (and Sofascore for 2025-26): tackles by third, dribblers tackled, ball recoveries and aerial duels. FBref no longer publishes a pressures count, so pressing is read from where a player wins the ball: tackles in midfield and the final third, recoveries and, for 2025-26, possession won in the final third.' + (' In Now mode these come from each player\'s latest season in the data.' if live else '') + ' These extra numbers are raw, not style-adjusted.</div>')
+        if adjm.startswith('Adjusted'): st.html('<div class="note" style="margin-top:8px">Adjusted for team style: defensive actions are scaled up for players whose team had more of the ball (2 / (1 + e^(-0.1 x (possession - 50))), about x1.4 at 58%), and actions on the ball are scaled down by the square root of the same factor. Goal threat and aerial win rate are not adjusted. Per-90 numbers shown are the adjusted ones; switch to Raw for the originals.</div>')
+    matrix_view()
 else:
     risky = squad.sort_values('risk', ascending=False); default = risky['player_id'].head(3).tolist() if live else (risky[risky['risk'] >= 1]['player_id'].head(4).tolist() if (risky['risk'] >= 1).sum() >= 2 else risky['player_id'].head(2).tolist())
     chosen = st.multiselect('Starters to replace', squad['player_id'].tolist(), default=default, format_func=lambda i: f"{squad.loc[squad['player_id'] == i, 'player'].iat[0]} ({squad.loc[squad['player_id'] == i, 'fine_pos'].iat[0]})", key='w_slots')

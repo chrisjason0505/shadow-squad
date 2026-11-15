@@ -193,3 +193,43 @@ def matrix_live(rows, zcols):
     from math import erf, sqrt
     cdf = lambda z: 50 * (1 + erf(z / sqrt(2))) if np.isfinite(z) else np.nan
     return {int(r['player_id']): {c[2:]: (cdf(float(r[c])), np.nan, None) for c in zcols} for _, r in rows.iterrows()}
+
+
+# ---- extended defending, pressing and aerial numbers (lake/defence_ext.parquet, src/build_defence.py) ----
+# Pressing is measured by where a player wins the ball: FBref no longer publishes a pressures count.
+MET_EXT = {'chal_pct': 'dribblers tackled (%)', 'tkl_def3_p90': 'tackles in his own third', 'press_hi_p90': 'tackles in midfield and the final third',
+           'won_att3_p90': 'possession won in the final third', 'recov_p90': 'ball recoveries', 'aer_w_p90': 'aerial duels won', 'aer_pct': 'aerial duels won (% of duels)',
+           'tklw_p90': 'tackles won', 'int_p90': 'interceptions', 'blocks_p90': 'blocks'}
+DEPT_MX_BT = {'Goal threat': ['gls', 'npxg', 'sh', 'att_pen'], 'Creation': ['ast', 'kp', 'sca', 'ppa'], 'Progression': ['prgp', 'prgc', 'take_on'],
+              'Defending': ['tklw', 'int', 'clr', 'blocks', 'chal_pct', 'tkl_def3_p90'], 'Pressing': ['press_hi_p90', 'recov_p90'], 'Aerial': ['aer_won', 'aer_w_p90']}
+DEPT_MX_LIVE = {'Goal threat': ['goals', 'npg', 'xG', 'npxG', 'shots'], 'Creation': ['assists', 'xA', 'key_passes'], 'Build-up': ['xGChain', 'xGBuildup'],
+                'Defending': ['tklw_p90', 'int_p90', 'blocks_p90'], 'Pressing': ['won_att3_p90', 'press_hi_p90', 'recov_p90'], 'Aerial': ['aer_w_p90', 'aer_pct']}
+# what matters first for each position: aerial for centre-backs and strikers, defending for the back line, pressing for midfield and attack
+DEPT_MX_ORDER = {'CB': ['Defending', 'Aerial', 'Pressing', 'Progression', 'Build-up', 'Creation', 'Goal threat'],
+                 'FB': ['Defending', 'Progression', 'Creation', 'Pressing', 'Build-up', 'Aerial', 'Goal threat'],
+                 'DM': ['Defending', 'Pressing', 'Progression', 'Build-up', 'Creation', 'Aerial', 'Goal threat'],
+                 'CM': ['Pressing', 'Progression', 'Build-up', 'Creation', 'Defending', 'Goal threat', 'Aerial'],
+                 'AM': ['Creation', 'Goal threat', 'Pressing', 'Progression', 'Build-up', 'Defending', 'Aerial'],
+                 'W': ['Creation', 'Goal threat', 'Pressing', 'Progression', 'Build-up', 'Defending', 'Aerial'],
+                 'ST': ['Goal threat', 'Aerial', 'Pressing', 'Creation', 'Build-up', 'Progression', 'Defending']}
+
+
+def ext_table(DX):
+    """(player_id, yr) -> row, preferring FBref over Sofascore when a season has both."""
+    return DX.sort_values('src').drop_duplicates(['player_id', 'yr']).set_index(['player_id', 'yr'])
+
+
+def matrix_ext(XT, pids, t, peak=False, metrics=None, latest=False):
+    """{pid: {metric: (percentile, value, season)}} from the extended table: season t, the best of t-2..t when peak, or each player's latest season when latest."""
+    metrics = metrics or list(MET_EXT); out = {}
+    years = XT.index.get_level_values(1)
+    for pid in pids:
+        if latest:
+            ys = sorted(years[XT.index.get_level_values(0) == pid]); ys = ys[-1:]
+        else: ys = (t - 2, t - 1, t) if peak else (t,)
+        rows = [(y, XT.loc[(pid, y)]) for y in ys if (pid, y) in XT.index]; d = {}
+        for m in metrics:
+            best = max(((r.get(m + '_pct', np.nan), r.get(m, np.nan), y) for y, r in rows if np.isfinite(r.get(m + '_pct', np.nan))), default=(np.nan, np.nan, None), key=lambda x: x[0])
+            d[m] = best
+        out[pid] = d
+    return out

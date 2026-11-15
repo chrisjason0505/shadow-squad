@@ -38,7 +38,7 @@ def _design(D):
 
 
 class StyleRatings:
-    def __init__(self, F, T, min_minutes=900):
+    def __init__(self, F, T, min_minutes=900, DX=None):
         T = T.copy(); T['x_poss'] = (T['possession'] - 50) / 10; T['x_press'] = -T['z_ppda']
         keep = ['squad', 'yr', 'possession', 'ppda', 'xga_pm', 'deep_allowed_pm', 'z_xga_pm', 'z_possession', 'z_ppda', 'rank_xga', 'n_teams', 'league', 'x_poss', 'x_press', 'tackles_pm', 'interceptions_pm', 'pts_pm', 'z_long_balls_pm', 'z_xg_pm']
         F = F.drop(columns=[c for c in ('possession',) if c in F]).copy()
@@ -68,6 +68,9 @@ class StyleRatings:
             if m == 'aer_won': continue
             P['share_' + m] = tot / tot.groupby([P['squad'], P['yr']]).transform('sum')
             P['rank_' + m] = tot.groupby([P['squad'], P['yr']]).rank(ascending=False, method='min')
+        if DX is not None:     # where he wins the ball (src/build_defence.py): the pressing proxy, and aerial volume
+            ex = DX[DX['src'] == 'fbref'][['player_id', 'yr', 'press_hi_p90', 'press_hi_p90_pct', 'recov_p90', 'recov_p90_pct', 'aer_w_p90', 'aer_w_p90_pct']].drop_duplicates(['player_id', 'yr'])
+            P = P.merge(ex, on=['player_id', 'yr'], how='left')
         self.P = P.set_index(['player_id', 'yr']); self.ok = ok.to_numpy()
         self._rate()
 
@@ -115,7 +118,7 @@ class StyleRatings:
         Focal point: the team leans on him (his share of the regulars' output, or the job the style hands him).
         Defensive intelligence: defends well in ways tackle counts miss (position, a high line, a tight defence).
         Role note: a neutral read of how he plays in the system.
-        Ball-winning stands in for pressing work: the FBref tables have tackles won and interceptions, not pressures.
+        Pressing is read from where he wins the ball (tackles in midfield and the final third, ball recoveries), because FBref no longer publishes pressures.
         Team shares are among the squad's regulars (900+ league minutes)."""
         r = self.get(pid, yr)
         if r is None: return []
@@ -129,7 +132,12 @@ class StyleRatings:
         T = [('Team possession', f"{poss:.0f}%")] if ok(poss) else []
         if ok(r.get('ppda', np.nan)): T.append(('Team PPDA (lower = harder press)', f"{r['ppda']:.1f}"))
         def add(cat, tag, score, text, ev): out.append({'cat': cat, 'tag': tag, 'score': float(score), 'text': text, 'ev': ev})
-        win, drib, threat, create, prog, aer = pct(['tklw', 'int']), pct(['take_on', 'prgc']), pct(['npxg', 'gls', 'sh']), pct(['kp', 'sca', 'ppa', 'ast']), pct(['prgp', 'prgc']), pct(['aer_won'])
+        hi = [r.get(c, np.nan) for c in ('press_hi_p90_pct', 'recov_p90_pct')]; hi = [v for v in hi if v is not None and np.isfinite(v)]
+        win = float(np.mean(hi)) if hi else pct(['tklw', 'int'])
+        def pr_ev():
+            if ok(r.get('press_hi_p90', np.nan), r.get('press_hi_p90_pct', np.nan)): return [('Tackles in midfield and final third', f"{r['press_hi_p90']:.2f} per 90 ({FB_ord(int(round(r['press_hi_p90_pct'])))} pct)"), ('Ball recoveries', f"{r['recov_p90']:.2f} per 90 ({FB_ord(int(round(r['recov_p90_pct'])))} pct)" if ok(r.get('recov_p90', np.nan), r.get('recov_p90_pct', np.nan)) else 'n/a')]
+            return [('Tackles won', per('tklw')), ('Interceptions', per('int'))]
+        _, drib, threat, create, prog, aer = None, pct(['take_on', 'prgc']), pct(['npxg', 'gls', 'sh']), pct(['kp', 'sca', 'ppa', 'ast']), pct(['prgp', 'prgc']), pct(['aer_won'])
         sh = lambda m: r.get('share_' + m, np.nan); rk = lambda m: r.get('rank_' + m, np.nan)
         def share_ev(m, label):
             return (f'Share of team {label}', f"{sh(m):.0%}, {FB_ord(int(rk(m)))} in the squad") if ok(sh(m), rk(m)) else (f'Team {label}', 'n/a')
@@ -138,9 +146,9 @@ class StyleRatings:
         # ---------- changes the team's dynamic ----------
         if pos in ('W', 'AM', 'CM', 'ST', 'FB') and ok(press, win, drib) and press >= 0.7 and win >= 65 and drib >= 70:
             add(D, 'Two-way engine in a pressing side', 2 + (win + drib) / 100, f"{club} pressed as hard as anyone, which drains attackers, yet he is {top(win)} of {PL} for winning the ball back and {top(drib)} for dribbles and carries. Most players in that system give up one side of the game; he keeps both.",
-                T[1:] + [('Tackles won', per('tklw')), ('Interceptions', per('int')), ('Dribbles completed', per('take_on')), ('Progressive carries', per('prgc'))])
+                T[1:] + pr_ev() + [('Dribbles completed', per('take_on')), ('Progressive carries', per('prgc'))])
         if pos in ('ST', 'W', 'AM') and ok(press, win, threat) and press >= 0.7 and win >= 70 and threat >= 70:
-            add(D, 'Presses and still scores', 2 + (win + threat) / 100, f"Leads the press in a high-intensity side ({top(win)} of {PL} for ball-winning) and is still {top(threat)} for goal threat.", T[1:] + [('Tackles won', per('tklw')), ('Non-penalty xG', per('npxg')), ('Goals', per('gls'))])
+            add(D, 'Presses and still scores', 2 + (win + threat) / 100, f"Leads the press in a high-intensity side ({top(win)} of {PL} for ball-winning) and is still {top(threat)} for goal threat.", T[1:] + pr_ev() + [('Non-penalty xG', per('npxg')), ('Goals', per('gls'))])
         for ms, word in ((['kp', 'sca', 'ppa', 'ast'], 'chance creation'), (['prgp', 'prgc', 'take_on'], 'ball progression')):
             sv = sup(ms)
             if ok(sv, poss) and sv >= 1.2 and poss <= 46:

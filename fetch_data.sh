@@ -11,3 +11,5 @@ get samyogguragai/top-5-european-leagues-2014-2025 understat_alt               #
 get hiuhiuthen/understat-player-league-2025-26 understat_2025                  # Understat player seasons 2025-26
 # Team style table for the app (possession, pressing, xG against). FotMob team JSONs are optional: put them in data/fotmob/<league>/<yyyy_yyyy>/teams/.
 [ -f lake/team_style.parquet ] || ${PY:-.venv/bin/python} src/build_team_style.py
+# Optional: 2025-26 defending numbers (PERFECT_scouting_data_2026.csv) go in data/chuong/ for src/build_defence.py
+[ -f lake/defence_ext.parquet ] || ${PY:-.venv/bin/python} src/build_defence.py
